@@ -1,10 +1,15 @@
 ethercat:
-  ifname: "eth0"             # 對接 AX58200 的網路介面
-  cycle_time_ms: 10          # 控制循環時間 (10ms = 100Hz)
-  safeop_timeout_us: 50000   # 等待進入 SAFE_OP 逾時 (微秒)
-  op_timeout_us: 50000       # 等待進入 OP 逾時 (微秒)
-  recv_timeout_us: 2000      # 接收 Process Data 逾時 (微秒)
+  ifname: "eth0"             # Linux 網卡名稱。Windows 請改成 pysoem.find_adapters() 印出的 \Device\NPF_{GUID}
+  cycle_time_ms: 10          # PDO 與 DC SYNC0 共用這個週期。ESI 最小週期為 0.2 ms
+  safeop_timeout_us: 3000000 # 等待 SAFE_OP（期間會持續交換 PDO）
+  op_timeout_us: 3000000     # 等待 OP（期間會持續交換 PDO）
+  recv_timeout_us: 2000      # 單次接收 Process Data 逾時（微秒）
 
 joint:
-  default_mode: 8            # 預設模式 (8: CSP)
-  jog_step: 1000             # JOG 步進刻度 (ticks)
+  jog_step: 1000             # JOG 步進刻度 (ticks)。實際移動會依 motion.jog_speed_cps 插補
+
+motion:
+  homing_speed_switch: 300   # 0x6099:01，尋原點搜尋速度
+  homing_speed_zero: 100     # 0x6099:02，尋零速度（韌體實際使用這個）
+  jog_speed_cps: 2000        # CSP 插補速度 (counts/s)
+  jog_min_ms: 300            # 再短的位移也不低於這個時間，避免一個週期走完
