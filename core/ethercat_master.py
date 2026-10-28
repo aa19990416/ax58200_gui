@@ -68,6 +68,8 @@ class EtherCATMasterThread(QThread):
 
         self.homing_speed_switch = int(motion.get("homing_speed_switch", 300))
         self.homing_speed_zero = int(motion.get("homing_speed_zero", 100))
+        # 向量對齊最長約 3 秒。這段時間內下尋原點會被 MCCMD_START 佔住而丟掉
+        self.homing_settle_s = max(0.5, float(motion.get("homing_settle_ms", 3500)) / 1000.0)
         self.jog_speed = max(1, int(motion.get("jog_speed_cps", 2000)))
         self.jog_min_s = max(0.05, float(motion.get("jog_min_ms", 300)) / 1000.0)
 
@@ -164,10 +166,15 @@ class EtherCATMasterThread(QThread):
             name = name.decode("utf-8", errors="replace")
         self._log(f"[*] 找到從站: {name}（共 {len(self.master.slaves)} 站）")
 
-        # SDO 必須在 PREOP 寫。0x1C32:02 在這份 ESI 是唯讀，週期改寫 :01 與 :10
+        # SDO 必須在 PREOP、而且要在 dc_sync 之前寫。0x1C32:02 在這份 ESI 是唯讀
         self.master.state = pysoem.PREOP_STATE
         self.master.write_state()
         self.master.state_check(pysoem.PREOP_STATE, 500_000)
+        self._sdo_u16(0x1C32, 1, 0x0002, "SM2 同步型別")
+        self._sdo_u16(0x1C33, 1, 0x0002, "SM3 同步型別")
+        self._sdo_u32(0x1C32, 10, self.cycle_ns, "Sync0 週期")
+        self._sdo_u32(0x6099, 1, self.homing_speed_switch, "尋原點搜尋速度")
+        self._sdo_u32(0x6099, 2, self.homing_speed_zero, "尋原點尋零速度")
 
         self.master.config_map()
         out_size = len(self.slave.output)
@@ -183,24 +190,12 @@ class EtherCATMasterThread(QThread):
             return False
         self._log(f"[*] PDO 映射確認 {PDO_SIZE} bytes，預期 WKC={self.expected_wkc}")
 
-        dc_ok = False
         try:
             self.master.config_dc()
             self.slave.dc_sync(True, self.cycle_ns, 0)
-            dc_ok = True
             self._log(f"[*] 已啟用 DC SYNC0，週期 {self.cycle_ns} ns")
         except Exception as exc:
             self._log(f"[!] DC 設定失敗，維持從站目前的同步模式: {exc}")
-
-        if dc_ok:
-            # 0x02 = DC SYNC0。只在 PREOP 可寫，失敗只記錄，ESC 暫存器已由 dc_sync 寫過
-            self._sdo_u16(0x1C32, 1, 0x0002, "SM2 同步型別")
-            self._sdo_u16(0x1C33, 1, 0x0002, "SM3 同步型別")
-            self._sdo_u32(0x1C32, 10, self.cycle_ns, "Sync0 週期")
-
-        # 韌體尋原點用 0x6099:02；預設只有 10，這裡在進 SAFE_OP 前寫好
-        self._sdo_u32(0x6099, 1, self.homing_speed_switch, "尋原點搜尋速度")
-        self._sdo_u32(0x6099, 2, self.homing_speed_zero, "尋原點尋零速度")
 
         self.slave.output = PdoHandler.pack_rx(0, 0, 0, 0)
 
@@ -407,7 +402,7 @@ class EtherCATMasterThread(QThread):
             if self._elapsed() >= 0.08:
                 self.job["retries"] += 1
                 if self.job["retries"] >= 3:
-                    self._fail("故障復位失敗。韌體要求先送 0x0000 再送 0x0080，目前重試 3 次仍在 Fault")
+                    self._fail("故障復位失敗。" + self._fault_hint())
                     return True
                 self.controlword = CMD_DISABLE_VOLTAGE
                 self._goto("fr_zero")
@@ -540,39 +535,90 @@ class EtherCATMasterThread(QThread):
             return "busy"
         return "busy"
 
+    def _fault_hint(self) -> str:
+        """0x7305 是尋原點函式逾時，不會進入 MCSTE_WAIT_CLR_ERR，0x0080 因此無效。"""
+        if self.err_code == 0x7305:
+            return (
+                "錯誤碼 0x7305 是尋原點逾時。這個 Fault 不是馬達堆疊的可清除錯誤，"
+                "請關掉驅動電源再開，不要只按故障清除"
+            )
+        if self.err_code:
+            return f"錯誤碼 0x{self.err_code:04X}。韌體只在馬達堆疊處於等待清錯時才接受 0x0080"
+        return "尚未讀到 0x603F。若 Statusword 仍是 Fault，請重新上電"
+
     def _job_homing(self):
         phase = self.job["phase"]
-        if phase != "watch":
-            # 尋原點的模式 6 必須在 Enable Operation 之前寫進 0x6061
+        if phase in ("enter", "drop", "arm", "enable"):
+            # 模式 6 必須在 Enable Operation 之前寫進 0x6061
             status = self._job_enable(MODE_HM, "", finish=False)
             if self.job is None or status != "ready":
                 return
             self.job["seen_clear"] = False
+            self.job["retries"] = 0
+            # 先不要送 bit 4。此時馬達堆疊多半還在向量對齊，命令槽被 MCCMD_START 佔住
+            self.controlword = CMD_ENABLE_OPERATION
+            self._goto("settle")
+            self._log(f"[*] 尋原點模式已使能，等待向量對齊 {self.homing_settle_s:.1f} 秒後才啟動")
+            return
+
+        if self._state() == "FAULT":
+            self.controlword = CMD_ENABLE_OPERATION
+            self._fail("尋原點過程進入 Fault。" + self._fault_hint())
+            return
+
+        sw = self.statusword
+        if phase == "settle":
+            self.controlword = CMD_ENABLE_OPERATION
+            if (sw & SW_HOMING_ATTAINED) and self._elapsed() >= self.homing_settle_s:
+                self.controlword = CMD_START_HOMING
+                self._goto("arming")
+                return
+            if self._elapsed() > self.homing_settle_s + 5.0:
+                self._fail("尋原點狀態機沒有進到待機（Statusword bit 12 沒有亮）")
+            return
+
+        if phase == "arming":
             self.controlword = CMD_START_HOMING
-            self._goto("watch")
+            if not (sw & SW_HOMING_ATTAINED):
+                self.job["seen_clear"] = True
+                self._goto("watch")
+                return
+            # 沒看到 bit 12 清掉就先放開，避免韌體 5 秒後鎖死成 0x7305
+            if self._elapsed() > 0.8:
+                self.job["retries"] += 1
+                self.controlword = CMD_ENABLE_OPERATION
+                if self.job["retries"] > 3:
+                    self._fail("尋原點啟動位沒有被接受。請確認激磁已完成後再按一次尋原點")
+                    return
+                self._log(f"[*] 尋原點尚未開始，先放開啟動位再試（{self.job['retries']}/3）")
+                self._goto("retry")
+            return
+
+        if phase == "retry":
+            self.controlword = CMD_ENABLE_OPERATION
+            if (sw & SW_HOMING_ATTAINED) and self._elapsed() > 0.5:
+                self.controlword = CMD_START_HOMING
+                self._goto("arming")
+                return
+            if self._elapsed() > 3.0:
+                self._fail("放開尋原點後沒有回到待機")
             return
 
         self.controlword = CMD_START_HOMING
-        sw = self.statusword
-        if sw & SW_HOMING_ERROR or self._state() == "FAULT":
+        if sw & SW_HOMING_ERROR:
             self.controlword = CMD_ENABLE_OPERATION
-            self._fail(f"尋原點失敗，錯誤碼 0x{self.err_code:04X}")
+            self._fail("尋原點失敗。" + self._fault_hint())
             return
-        # 待機時 bit 12 就是 1。必須先看到它被清掉，才代表尋原點真的開始
         if not (sw & SW_HOMING_ATTAINED):
             self.job["seen_clear"] = True
         if self.job["seen_clear"] and (sw & SW_HOMING_ATTAINED) and (sw & SW_TARGET_REACHED):
             self.controlword = CMD_ENABLE_OPERATION
             self.target_position = self.actual_position
-            self._ok(f"尋原點完成，位置={self.actual_position}。請再按 CSP，不要在激磁中直接改模式")
+            self._ok(f"尋原點完成，位置={self.actual_position}。請再按 CSP")
             return
-        if not self.job["seen_clear"] and self._elapsed() > 3.0:
+        if self._elapsed() > 12.0:
             self.controlword = CMD_ENABLE_OPERATION
-            self._fail("尋原點沒有啟動。bit 12 在待機時就是 1，必須先看到它清掉")
-            return
-        if self._elapsed() > 20.0:
-            self.controlword = CMD_ENABLE_OPERATION
-            self._fail("尋原點逾時")
+            self._fail("尋原點超過 12 秒仍未完成，已放開啟動位")
 
     def _job_quick_stop(self):
         phase = self.job["phase"]
