@@ -1,0 +1,10 @@
+ethercat:
+  ifname: "eth0"             # 對接 AX58200 的網路介面
+  cycle_time_ms: 10          # 控制循環時間 (10ms = 100Hz)
+  safeop_timeout_us: 50000   # 等待進入 SAFE_OP 逾時 (微秒)
+  op_timeout_us: 50000       # 等待進入 OP 逾時 (微秒)
+  recv_timeout_us: 2000      # 接收 Process Data 逾時 (微秒)
+
+joint:
+  default_mode: 8            # 預設模式 (8: CSP)
+  jog_step: 1000             # JOG 步進刻度 (ticks)
